@@ -1,5 +1,10 @@
 Modified for babe consensus.
 
+https://github.com/substrate-developer-hub/substrate-node-template/issues/19
+
+https://github.com/paritytech/substrate/pull/3790/files
+
+
 # Substrate Node Template
 
 A fresh FRAME-based [Substrate](https://www.substrate.io/) node, ready for hacking :rocket:
