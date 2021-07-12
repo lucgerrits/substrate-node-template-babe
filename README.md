@@ -4,6 +4,7 @@ https://github.com/substrate-developer-hub/substrate-node-template/issues/19
 
 https://github.com/paritytech/substrate/pull/3790/files
 
+https://github.com/paritytech/substrate/blob/master/bin/node/runtime/src/lib.rs
 
 # Substrate Node Template
 

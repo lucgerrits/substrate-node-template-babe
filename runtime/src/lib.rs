@@ -13,12 +13,15 @@ use sp_runtime::{
 	transaction_validity::{TransactionValidity, TransactionSource},
 };
 use sp_runtime::traits::{
-	AccountIdLookup, BlakeTwo256, Block as BlockT, Verify, IdentifyAccount, NumberFor,
+	AccountIdLookup, BlakeTwo256, Block as BlockT, Verify, IdentifyAccount, NumberFor, OpaqueKeys
 };
+pub use node_primitives::{AccountId, Signature};
+use node_primitives::{AccountIndex, Balance, BlockNumber, Hash, Index, Moment};
 use sp_api::impl_runtime_apis;
-use sp_consensus_aura::sr25519::AuthorityId as AuraId;
+use sp_consensus_babe::{AuthorityId as BabeId};
 use pallet_grandpa::{AuthorityId as GrandpaId, AuthorityList as GrandpaAuthorityList};
 use pallet_grandpa::fg_primitives;
+use pallet_im_online::sr25519::AuthorityId as ImOnlineId;
 use sp_version::RuntimeVersion;
 #[cfg(feature = "std")]
 use sp_version::NativeVersion;
@@ -31,13 +34,23 @@ pub use pallet_balances::Call as BalancesCall;
 pub use sp_runtime::{Permill, Perbill};
 pub use frame_support::{
 	construct_runtime, parameter_types, StorageValue,
-	traits::{KeyOwnerProofSystem, Randomness},
+	traits::{KeyOwnerProofSystem, Randomness, OnUnbalanced, Currency},
 	weights::{
 		Weight, IdentityFee,
 		constants::{BlockExecutionWeight, ExtrinsicBaseWeight, RocksDbWeight, WEIGHT_PER_SECOND},
 	},
 };
 use pallet_transaction_payment::CurrencyAdapter;
+use pallet_session::{historical as pallet_session_historical};
+pub use pallet_staking::StakerStatus;
+
+/// Implementations of some helper traits passed into runtime modules as associated types.
+pub mod impls;
+use impls::Author;
+
+/// Constant values used within the runtime.
+pub mod constants;
+use constants::{time::*, currency::*};
 
 /// Import the template pallet.
 pub use pallet_template;
@@ -72,10 +85,10 @@ pub type DigestItem = generic::DigestItem<Hash>;
 /// the specifics of the runtime. They can then be made to be agnostic over specific formats
 /// of data like extrinsics, allowing for them to continue syncing the network through upgrades
 /// to even the core data structures.
-pub mod opaque {
-	use super::*;
+// pub mod opaque {
+// 	use super::*;
 
-	pub use sp_runtime::OpaqueExtrinsic as UncheckedExtrinsic;
+// 	pub use sp_runtime::OpaqueExtrinsic as UncheckedExtrinsic;
 
 	/// Opaque block header type.
 	pub type Header = generic::Header<BlockNumber, BlakeTwo256>;
@@ -86,11 +99,13 @@ pub mod opaque {
 
 	impl_opaque_keys! {
 		pub struct SessionKeys {
-			pub aura: Aura,
+			pub babe: BabeId,
 			pub grandpa: Grandpa,
+			pub im_online: ImOnline,
+			pub authority_discovery: AuthorityDiscovery,
 		}
 	}
-}
+// }
 
 pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: create_runtime_str!("node-template"),
@@ -103,11 +118,21 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 };
 
 
-/// This determines the average expected block time that we are targeting.
-/// Blocks will be produced at a minimum duration defined by `SLOT_DURATION`.
-/// `SLOT_DURATION` is picked up by `pallet_timestamp` which is in turn picked
-/// up by `pallet_aura` to implement `fn slot_duration()`.
-///
+/// Constants for Babe.
+
+/// Since BABE is probabilistic this is the average expected block time that
+/// we are targetting. Blocks will be produced at a minimum duration defined
+/// by `SLOT_DURATION`, but some slots will not be allocated to any
+/// authority and hence no block will be produced. We expect to have this
+/// block time on average following the defined slot duration and the value
+/// of `c` configured for BABE (where `1 - c` represents the probability of
+/// a slot being empty).
+/// This value is only used indirectly to define the unit constants below
+/// that are expressed in blocks. The rest of the code should use
+/// `SLOT_DURATION` instead (like the timestamp module for calculating the
+/// minimum period).
+/// <https://research.web3.foundation/en/latest/polkadot/BABE/Babe/#6-practical-results>
+/// 
 /// Change this to adjust the block time.
 pub const MILLISECS_PER_BLOCK: u64 = 6000;
 
@@ -117,6 +142,20 @@ pub const SLOT_DURATION: u64 = MILLISECS_PER_BLOCK;
 pub const MINUTES: BlockNumber = 60_000 / (MILLISECS_PER_BLOCK as BlockNumber);
 pub const HOURS: BlockNumber = MINUTES * 60;
 pub const DAYS: BlockNumber = HOURS * 24;
+
+pub const EPOCH_DURATION_IN_BLOCKS: u32 = 10 * MINUTES;
+
+// 1 in 4 blocks (on average, not counting collisions) will be primary BABE blocks.
+pub const PRIMARY_PROBABILITY: (u64, u64) = (1, 4);
+
+// NOTE: Currently it is not possible to change the epoch duration after the chain has started.
+//       Attempting to do so will brick block production.
+// pub const EPOCH_DURATION_IN_BLOCKS: BlockNumber = 10 * MINUTES;
+pub const EPOCH_DURATION_IN_SLOTS: u64 = {
+	const SLOT_FILL_RATE: f64 = MILLISECS_PER_BLOCK as f64 / SLOT_DURATION as f64;
+
+	(EPOCH_DURATION_IN_BLOCKS as f64 * SLOT_FILL_RATE) as u64
+};
 
 /// The version information used to identify this runtime when compiled natively.
 #[cfg(feature = "std")]
@@ -128,6 +167,24 @@ pub fn native_version() -> NativeVersion {
 }
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
+
+type NegativeImbalance = <Balances as Currency<AccountId>>::NegativeImbalance;
+
+pub struct DealWithFees;
+impl OnUnbalanced<NegativeImbalance> for DealWithFees {
+	fn on_unbalanceds<B>(mut fees_then_tips: impl Iterator<Item=NegativeImbalance>) {
+		if let Some(fees) = fees_then_tips.next() {
+			// for fees, 80% to treasury, 20% to author
+			let mut split = fees.ration(80, 20);
+			if let Some(tips) = fees_then_tips.next() {
+				// for tips, if any, 80% to treasury, 20% to author (though this can be anything)
+				tips.ration_merge_into(80, 20, &mut split);
+			}
+			Treasury::on_unbalanced(split.0);
+			Author::on_unbalanced(split.1);
+		}
+	}
+}
 
 parameter_types! {
 	pub const Version: RuntimeVersion = VERSION;
@@ -191,9 +248,6 @@ impl frame_system::Config for Runtime {
 	type SS58Prefix = SS58Prefix;
 }
 
-impl pallet_aura::Config for Runtime {
-	type AuthorityId = AuraId;
-}
 
 impl pallet_grandpa::Config for Runtime {
 	type Event = Event;
@@ -221,8 +275,194 @@ parameter_types! {
 impl pallet_timestamp::Config for Runtime {
 	/// A timestamp: milliseconds since the unix epoch.
 	type Moment = u64;
-	type OnTimestampSet = Aura;
+	type OnTimestampSet = Babe;
 	type MinimumPeriod = MinimumPeriod;
+	type WeightInfo = ();
+}
+
+parameter_types! {
+	pub const EpochDuration: u64 = EPOCH_DURATION_IN_SLOTS;
+	pub const ExpectedBlockTime: Moment = MILLISECS_PER_BLOCK;
+	pub const ReportLongevity: u64 =
+		BondingDuration::get() as u64 * SessionsPerEra::get() as u64 * EpochDuration::get();
+}
+
+impl pallet_babe::Config for Runtime {
+	type EpochDuration = EpochDuration;
+	type ExpectedBlockTime = ExpectedBlockTime;
+	type EpochChangeTrigger = pallet_babe::ExternalTrigger;
+
+	type KeyOwnerProofSystem = Historical;
+
+	type KeyOwnerProof = <Self::KeyOwnerProofSystem as KeyOwnerProofSystem<(
+		KeyTypeId,
+		pallet_babe::AuthorityId,
+	)>>::Proof;
+
+	type KeyOwnerIdentification = <Self::KeyOwnerProofSystem as KeyOwnerProofSystem<(
+		KeyTypeId,
+		pallet_babe::AuthorityId,
+	)>>::IdentificationTuple;
+
+	type HandleEquivocation =
+		pallet_babe::EquivocationHandler<Self::KeyOwnerIdentification, Offences, ReportLongevity>;
+
+	type WeightInfo = ();
+}
+
+impl pallet_authority_discovery::Config for Runtime {}
+
+parameter_types! {
+	pub const UncleGenerations: BlockNumber = 5;
+}
+
+impl pallet_authorship::Config for Runtime {
+	type FindAuthor = pallet_session::FindAccountFromAuthorIndex<Self, Babe>;
+	type UncleGenerations = UncleGenerations;
+	type FilterUncle = ();
+	type EventHandler = (Staking, ImOnline);
+}
+
+parameter_types! {
+	pub const DisabledValidatorsThreshold: Perbill = Perbill::from_percent(17);
+}
+
+impl pallet_session::Config for Runtime {
+	type Event = Event;
+	type ValidatorId = <Self as frame_system::Config>::AccountId;
+	type ValidatorIdOf = pallet_staking::StashOf<Self>;
+	type ShouldEndSession = Babe;
+	type NextSessionRotation = Babe;
+	type SessionManager = pallet_session::historical::NoteHistoricalRoot<Self, Staking>;
+	type SessionHandler = <SessionKeys as OpaqueKeys>::KeyTypeIdProviders;
+	type Keys = SessionKeys;
+	type DisabledValidatorsThreshold = DisabledValidatorsThreshold;
+	type WeightInfo = pallet_session::weights::SubstrateWeight<Runtime>;
+}
+
+impl pallet_session::historical::Config for Runtime {
+	type FullIdentification = pallet_staking::Exposure<AccountId, Balance>;
+	type FullIdentificationOf = pallet_staking::ExposureOf<Runtime>;
+}
+
+impl pallet_im_online::Config for Runtime {
+	type AuthorityId = ImOnlineId;
+	type Event = Event;
+	type ValidatorSet = Historical;
+	type SessionDuration = SessionDuration;
+	type ReportUnresponsiveness = Offences;
+	type UnsignedPriority = ImOnlineUnsignedPriority;
+	type WeightInfo = pallet_im_online::weights::SubstrateWeight<Runtime>;
+}
+
+parameter_types! {
+	pub OffencesWeightSoftLimit: Weight = Perbill::from_percent(60) *
+		RuntimeBlockWeights::get().max_block;
+}
+
+impl pallet_offences::Config for Runtime {
+	type Event = Event;
+	type IdentificationTuple = pallet_session::historical::IdentificationTuple<Self>;
+	type OnOffenceHandler = Staking;
+	type WeightSoftLimit = OffencesWeightSoftLimit;
+}
+
+parameter_types! {
+	pub const SessionsPerEra: sp_staking::SessionIndex = 6;
+	pub const BondingDuration: pallet_staking::EraIndex = 24 * 28;
+	pub const SlashDeferDuration: pallet_staking::EraIndex = 24 * 7; // 1/4 the bonding duration.
+	pub const RewardCurve: &'static PiecewiseLinear<'static> = &REWARD_CURVE;
+	pub const MaxNominatorRewardedPerValidator: u32 = 256;
+	pub const ElectionLookahead: BlockNumber = EPOCH_DURATION_IN_BLOCKS / 4;
+	pub const MaxIterations: u32 = 10;
+	// 0.05%. The higher the value, the more strict solution acceptance becomes.
+	pub MinSolutionScoreBump: Perbill = Perbill::from_rational_approximation(5u32, 10_000);
+	pub OffchainSolutionWeightLimit: Weight = RuntimeBlockWeights::get()
+		.get(DispatchClass::Normal)
+		.max_extrinsic.expect("Normal extrinsics have a weight limit configured; qed")
+		.saturating_sub(BlockExecutionWeight::get());
+}
+
+impl pallet_staking::Config for Runtime {
+	type Currency = Balances;
+	type UnixTime = Timestamp;
+	type CurrencyToVote = U128CurrencyToVote;
+	type RewardRemainder = Treasury;
+	type Event = Event;
+	type Slash = Treasury; // send the slashed funds to the treasury.
+	type Reward = (); // rewards are minted from the void
+	type SessionsPerEra = SessionsPerEra;
+	type BondingDuration = BondingDuration;
+	type SlashDeferDuration = SlashDeferDuration;
+	/// A super-majority of the council can cancel the slash.
+	type SlashCancelOrigin = EnsureOneOf<
+		AccountId,
+		EnsureRoot<AccountId>,
+		pallet_collective::EnsureProportionAtLeast<_3, _4, AccountId, CouncilCollective>
+	>;
+	type SessionInterface = Self;
+	type RewardCurve = RewardCurve;
+	type NextNewSession = Session;
+	type ElectionLookahead = ElectionLookahead;
+	type Call = Call;
+	type MaxIterations = MaxIterations;
+	type MinSolutionScoreBump = MinSolutionScoreBump;
+	type MaxNominatorRewardedPerValidator = MaxNominatorRewardedPerValidator;
+	type UnsignedPriority = StakingUnsignedPriority;
+	// The unsigned solution weight targeted by the OCW. We set it to the maximum possible value of
+	// a single extrinsic.
+	type OffchainSolutionWeightLimit = OffchainSolutionWeightLimit;
+	type WeightInfo = pallet_staking::weights::SubstrateWeight<Runtime>;
+}
+
+parameter_types! {
+	pub const ProposalBond: Permill = Permill::from_percent(5);
+	pub const ProposalBondMinimum: Balance = 1 * DOLLARS;
+	pub const SpendPeriod: BlockNumber = 1 * DAYS;
+	pub const Burn: Permill = Permill::from_percent(50);
+	pub const TipCountdown: BlockNumber = 1 * DAYS;
+	pub const TipFindersFee: Percent = Percent::from_percent(20);
+	pub const TipReportDepositBase: Balance = 1 * DOLLARS;
+	pub const DataDepositPerByte: Balance = 1 * CENTS;
+	pub const BountyDepositBase: Balance = 1 * DOLLARS;
+	pub const BountyDepositPayoutDelay: BlockNumber = 1 * DAYS;
+	pub const TreasuryModuleId: ModuleId = ModuleId(*b"py/trsry");
+	pub const BountyUpdatePeriod: BlockNumber = 14 * DAYS;
+	pub const MaximumReasonLength: u32 = 16384;
+	pub const BountyCuratorDeposit: Permill = Permill::from_percent(50);
+	pub const BountyValueMinimum: Balance = 5 * DOLLARS;
+}
+
+impl pallet_treasury::Config for Runtime {
+	type ModuleId = TreasuryModuleId;
+	type Currency = Balances;
+	type ApproveOrigin = EnsureOneOf<
+		AccountId,
+		EnsureRoot<AccountId>,
+		pallet_collective::EnsureProportionAtLeast<_3, _5, AccountId, CouncilCollective>
+	>;
+	type RejectOrigin = EnsureOneOf<
+		AccountId,
+		EnsureRoot<AccountId>,
+		pallet_collective::EnsureProportionMoreThan<_1, _2, AccountId, CouncilCollective>
+	>;
+	type Event = Event;
+	type OnSlash = ();
+	type ProposalBond = ProposalBond;
+	type ProposalBondMinimum = ProposalBondMinimum;
+	type SpendPeriod = SpendPeriod;
+	type Burn = Burn;
+	type BurnDestination = ();
+	type SpendFunds = Bounties;
+	type WeightInfo = pallet_treasury::weights::SubstrateWeight<Runtime>;
+}
+
+impl pallet_mmr::Config for Runtime {
+	const INDEXING_PREFIX: &'static [u8] = b"mmr";
+	type Hashing = <Runtime as frame_system::Config>::Hashing;
+	type Hash = <Runtime as frame_system::Config>::Hash;
+	type LeafData = frame_system::Module<Self>;
+	type OnNewRoot = ();
 	type WeightInfo = ();
 }
 
@@ -268,13 +508,23 @@ impl pallet_template::Config for Runtime {
 construct_runtime!(
 	pub enum Runtime where
 		Block = Block,
-		NodeBlock = opaque::Block,
+		NodeBlock = node_primitives::Block,
+		// NodeBlock = opaque::Block,
 		UncheckedExtrinsic = UncheckedExtrinsic
 	{
 		System: frame_system::{Module, Call, Config, Storage, Event<T>},
 		RandomnessCollectiveFlip: pallet_randomness_collective_flip::{Module, Call, Storage},
 		Timestamp: pallet_timestamp::{Module, Call, Storage, Inherent},
-		Aura: pallet_aura::{Module, Config<T>},
+		Babe: pallet_babe::{Module, Call, Storage, Config, Inherent, ValidateUnsigned},
+		Session: pallet_session::{Module, Call, Storage, Event, Config<T>},
+		Historical: pallet_session_historical::{Module},
+		ImOnline: pallet_im_online::{Module, Call, Storage, Event<T>, ValidateUnsigned, Config<T>},
+		Staking: pallet_staking::{Module, Call, Config<T>, Storage, Event<T>, ValidateUnsigned},
+		Authorship: pallet_authorship::{Module, Call, Storage, Inherent},
+		Offences: pallet_offences::{Module, Call, Storage, Event},
+		Treasury: pallet_treasury::{Module, Call, Storage, Config, Event<T>},
+		AuthorityDiscovery: pallet_authority_discovery::{Module, Call, Config},
+		Mmr: pallet_mmr::{Module, Storage},
 		Grandpa: pallet_grandpa::{Module, Call, Storage, Config, Event},
 		Balances: pallet_balances::{Module, Call, Storage, Config<T>, Event<T>},
 		TransactionPayment: pallet_transaction_payment::{Module, Storage},
@@ -316,6 +566,20 @@ pub type Executive = frame_executive::Executive<
 	Runtime,
 	AllModules,
 >;
+
+/// MMR helper types.
+mod mmr {
+	use super::Runtime;
+	pub use pallet_mmr::primitives::*;
+
+	pub type Leaf = <
+		<Runtime as pallet_mmr::Config>::LeafData
+		as
+		LeafDataProvider
+	>::LeafData;
+	pub type Hash = <Runtime as pallet_mmr::Config>::Hash;
+	pub type Hashing = <Runtime as pallet_mmr::Config>::Hashing;
+}
 
 impl_runtime_apis! {
 	impl sp_api::Core<Block> for Runtime {
@@ -379,13 +643,21 @@ impl_runtime_apis! {
 		}
 	}
 
-	impl sp_consensus_aura::AuraApi<Block, AuraId> for Runtime {
-		fn slot_duration() -> u64 {
-			Aura::slot_duration()
-		}
-
-		fn authorities() -> Vec<AuraId> {
-			Aura::authorities()
+	impl sp_consensus_babe::BabeApi<Block> for Runtime {
+		fn configuration() -> sp_consensus_babe::BabeEpochConfiguration {
+			// The choice of `c` parameter (where `1 - c` represents the
+			// probability of a slot being empty), is done in accordance to the
+			// slot duration and expected target block time, for safely
+			// resisting network delays of maximum two seconds.
+			// <https://research.web3.foundation/en/latest/polkadot/BABE/Babe/#6-practical-results>
+			sp_consensus_babe::BabeEpochConfiguration {
+				slot_duration: Babe::slot_duration(),
+				epoch_length: EpochDuration::get(),
+				c: PRIMARY_PROBABILITY,
+				genesis_authorities: Babe::authorities(),
+				randomness: Babe::randomness(),
+				secondary_slots: true,
+			}
 		}
 	}
 
@@ -448,6 +720,43 @@ impl_runtime_apis! {
 			TransactionPayment::query_fee_details(uxt, len)
 		}
 	}
+
+	impl pallet_mmr::primitives::MmrApi<
+		Block,
+		mmr::Leaf,
+		mmr::Hash,
+	> for Runtime {
+		fn generate_proof(leaf_index: u64) -> Result<(mmr::Leaf, mmr::Proof<mmr::Hash>), mmr::Error> {
+			Mmr::generate_proof(leaf_index)
+		}
+
+		fn verify_proof(leaf: mmr::Leaf, proof: mmr::Proof<mmr::Hash>) -> Result<(), mmr::Error> {
+			Mmr::verify_leaf(leaf, proof)
+		}
+
+		fn verify_proof_stateless(
+			root: mmr::Hash,
+			leaf: Vec<u8>,
+			proof: mmr::Proof<mmr::Hash>
+		) -> Result<(), mmr::Error> {
+			let node = mmr::DataOrHash::Data(mmr::OpaqueLeaf(leaf));
+			pallet_mmr::verify_leaf_proof::<mmr::Hashing, _>(root, node, proof)
+		}
+	}
+
+	impl sp_session::SessionKeys<Block> for Runtime {
+		fn generate_session_keys(seed: Option<Vec<u8>>) -> Vec<u8> {
+			SessionKeys::generate(seed)
+		}
+
+		fn decode_session_keys(
+			encoded: Vec<u8>,
+		) -> Option<Vec<(Vec<u8>, KeyTypeId)>> {
+			SessionKeys::decode_into_raw_public_keys(&encoded)
+		}
+	}
+
+
 
 	#[cfg(feature = "runtime-benchmarks")]
 	impl frame_benchmarking::Benchmark<Block> for Runtime {

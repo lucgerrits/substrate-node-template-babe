@@ -34,7 +34,17 @@ frame-support = { default-features = false, version = '3.0.0' }
 frame-system = { default-features = false, version = '3.0.0' }
 frame-system-benchmarking = { default-features = false, optional = true, version = '3.0.0' }
 frame-system-rpc-runtime-api = { default-features = false, version = '3.0.0' }
-pallet-aura = { default-features = false, version = '3.0.0' }
+node-primitives = { version = "2.0.0", default-features = false }
+# pallet-contracts-primitives = { version = "2.0.0", default-features = false }
+pallet-babe = { default-features = false, version = '3.0.0' }
+pallet-im-online = { version = "3.0.0", default-features = false }
+pallet-session = { version = "3.0.0", features = ["historical"], default-features = false }
+pallet-staking = { version = "3.0.0", default-features = false }
+pallet-authorship = { version = "3.0.0", default-features = false }
+pallet-offences = { version = "3.0.0", default-features = false }
+pallet-treasury = { version = "3.0.0", default-features = false }
+pallet-authority-discovery = { version = "3.0.0", default-features = false }
+pallet-mmr = { version = "3.0.0", default-features = false }
 pallet-balances = { default-features = false, version = '3.0.0' }
 pallet-grandpa = { default-features = false, version = '3.0.0' }
 pallet-randomness-collective-flip = { default-features = false, version = '3.0.0' }
@@ -44,7 +54,7 @@ pallet-transaction-payment = { default-features = false, version = '3.0.0' }
 pallet-transaction-payment-rpc-runtime-api = { default-features = false, version = '3.0.0' }
 sp-api = { default-features = false, version = '3.0.0' }
 sp-block-builder = { default-features = false, version = '3.0.0' }
-sp-consensus-aura = { default-features = false, version = '0.9.0' }
+sp-consensus-babe = { default-features = false, version = '0.9.0' }
 sp-core = { default-features = false, version = '3.0.0' }
 sp-inherents = { default-features = false, version = '3.0.0' }
 sp-offchain = { default-features = false, version = '3.0.0' }
@@ -53,6 +63,12 @@ sp-session = { default-features = false, version = '3.0.0' }
 sp-std = { default-features = false, version = '3.0.0' }
 sp-transaction-pool = { default-features = false, version = '3.0.0' }
 sp-version = { default-features = false, version = '3.0.0' }
+sp-staking = { version = "3.0.0", default-features = false }
+sp-authority-discovery = { version = "3.0.0", default-features = false }
+
+
+[dev-dependencies]
+sp-io = { version = "3.0.0"}
 
 [features]
 default = ['std']
@@ -73,7 +89,17 @@ std = [
     'frame-support/std',
     'frame-system/std',
     'frame-system-rpc-runtime-api/std',
-    'pallet-aura/std',
+    'pallet-babe/std',
+	"sp-staking/std",
+	"pallet-staking/std",
+    "pallet-authorship/std",
+    "pallet-offences/std",
+    "pallet-treasury/std",
+    "node-primitives/std",
+    "sp-authority-discovery/std",
+    "pallet-authority-discovery/std",
+    "pallet-mmr/std",
+    # "pallet-contracts-primitives/std",
     'pallet-balances/std',
     'pallet-grandpa/std',
     'pallet-randomness-collective-flip/std',
@@ -84,7 +110,8 @@ std = [
     'pallet-transaction-payment-rpc-runtime-api/std',
     'sp-api/std',
     'sp-block-builder/std',
-    'sp-consensus-aura/std',
+    'sp-consensus-babe/std',
+	"pallet-im-online/std",
     'sp-core/std',
     'sp-inherents/std',
     'sp-offchain/std',
